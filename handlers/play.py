@@ -1,68 +1,115 @@
+import json
+import os
 from os import path
+from typing import Callable
 
-from pyrogram import Client
-from pyrogram.types import Message, Voice
+import aiofiles
+import aiohttp
+import ffmpeg
+import requests
+import wget
+from PIL import Image, ImageDraw, ImageFont
+from pyrogram import Client, filters
+from pyrogram.types import Voice
+from pyrogram.errors import UserAlreadyParticipant
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from Python_ARQ import ARQ
+from youtube_search import YoutubeSearch
 
-from callsmusic import callsmusic, queues
+from MusicMan.config import ARQ_API_KEY
+from MusicMan.config import BOT_NAME as bn
+from MusicMan.config import DURATION_LIMIT
+from MusicMan.config import UPDATES_CHANNEL as updateschannel
+from MusicMan.config import que
+from MusicMan.config import SOURCE_CODE,ASSISTANT_NAME,PROJECT_NAME,SUPPORT_GROUP,BOT_USERNAME, OWNER
+from MusicMan.function.admins import admins as a
+from MusicMan.helpers.admins import get_administrators
+from MusicMan.helpers.channelmusic import get_chat_id
+from MusicMan.helpers.errors import DurationLimitError
+from MusicMan.helpers.decorators import errors
+from MusicMan.helpers.decorators import authorized_users_only
+from MusicMan.helpers.filters import command, other_filters
+from MusicMan.helpers.gets import get_file_name
+from MusicMan.services.callsmusic import callsmusic, queues
+from MusicMan.services.callsmusic.callsmusic import client as USER
+from MusicMan.services.converter.converter import convert
+from MusicMan.services.downloaders import youtube
 
-import converter
-from downloaders import youtube
+aiohttpsession = aiohttp.ClientSession()
+chat_id = None
+arq = ARQ("https://thearq.tech", ARQ_API_KEY, aiohttpsession)
+DISABLED_GROUPS = []
+useer ="NaN"
+def cb_admin_check(func: Callable) -> Callable:
+    async def decorator(client, cb):
+        admemes = a.get(cb.message.chat.id)
+        if cb.from_user.id in admemes:
+            return await func(client, cb)
+        else:
+            await cb.answer("Kamu tidak diizinkan!", show_alert=True)
+            return
 
-from config import BOT_NAME as bn, DURATION_LIMIT
-from helpers.filters import command, other_filters
-from helpers.decorators import errors
-from helpers.errors import DurationLimitError
-from helpers.gets import get_url, get_file_name
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    return decorator
 
-@Client.on_message(command("play") & other_filters)
-@errors
-async def play(_, message: Message):
 
-    lel = await message.reply("🔄 **Processing** sounds...")
-    sender_id = message.from_user.id
-    sender_name = message.from_user.first_name
+def transcode(filename):
+    ffmpeg.input(filename).output(
+        "input.raw", format="s16le", acodec="pcm_s16le", ac=2, ar="48k"
+    ).overwrite_output().run()
+    os.remove(filename)
 
-    keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        text="🔊 Channel",
-                        url="https://t.me/Infinity_BOTs")
-                   
-                ]
-            ]
-        )
 
-    audio = (message.reply_to_message.audio or message.reply_to_message.voice) if message.reply_to_message else None
-    url = get_url(message)
+# Convert seconds to mm:ss
+def convert_seconds(seconds):
+    seconds = seconds % (24 * 3600)
+    seconds %= 3600
+    minutes = seconds // 60
+    seconds %= 60
+    return "%02d:%02d" % (minutes, seconds)
 
-    if audio:
-        if round(audio.duration / 60) > DURATION_LIMIT:
-            raise DurationLimitError(
-                f"❌ Videos longer than {DURATION_LIMIT} minute(s) aren't allowed to play!"
-            )
 
-        file_name = get_file_name(audio)
-        file_path = await converter.convert(
-            (await message.reply_to_message.download(file_name))
-            if not path.isfile(path.join("downloads", file_name)) else file_name
-        )
-    elif url:
-        file_path = await converter.convert(youtube.download(url))
-    else:
-        return await lel.edit_text("❗ You did not give me anything to play!")
+# Convert hh:mm:ss to seconds
+def time_to_seconds(time):
+    stringt = str(time)
+    return sum(int(x) * 60 ** i for i, x in enumerate(reversed(stringt.split(":"))))
 
-    if message.chat.id in callsmusic.pytgcalls.active_calls:
-        position = await queues.put(message.chat.id, file=file_path)
-        await lel.edit(f"#⃣ **Queued** at position {position}!")
-    else:
-        callsmusic.pytgcalls.join_group_call(message.chat.id, file_path)
-        await message.reply_photo(
-        photo="https://telegra.ph/file/a4fa687ed647cfef52402.jpg",
-        reply_markup=keyboard,
-        caption="▶️ **Playing** here the song requested by {}!".format(
-        message.from_user.mention()
-        ),
+
+# Change image size
+def changeImageSize(maxWidth, maxHeight, image):
+    widthRatio = maxWidth / image.size[0]
+    heightRatio = maxHeight / image.size[1]
+    newWidth = int(widthRatio * image.size[0])
+    newHeight = int(heightRatio * image.size[1])
+    newImage = image.resize((newWidth, newHeight))
+    return newImage
+
+
+async def generate_cover(requested_by, title, views, duration, thumbnail):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(thumbnail) as resp:
+            if resp.status == 200:
+                f = await aiofiles.open("background.png", mode="wb")
+                await f.write(await resp.read())
+                await f.close()
+
+    image1 = Image.open("./background.png")
+    image2 = Image.open("./etc/foreground.png")
+    image3 = changeImageSize(1280, 720, image1)
+    image4 = changeImageSize(1280, 720, image2)
+    image5 = image3.convert("RGBA")
+    image6 = image4.convert("RGBA")
+    Image.alpha_composite(image5, image6).save("temp.png")
+    img = Image.open("temp.png")
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype("etc/font.otf", 32)
+    draw.text((205, 550), f"Title: {title}", (51, 215, 255), font=font)
+    draw.text((205, 590), f"Duration: {duration}", (255, 255, 255), font=font)
+    draw.text((205, 630), f"Views: {views}", (255, 255, 255), font=font)
+    draw.text(
+        (205, 670),
+        f"Added By: {requested_by}",
+        (255, 255, 255),
+        font=font,
     )
-        return await lel.delete()
+    img.save("final.png")
+    os.remov
